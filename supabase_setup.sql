@@ -68,7 +68,10 @@ CREATE POLICY "Allow all operations on collection_progress"
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
-    NEW.updated_at = NOW();
+    IF TG_OP = 'UPDATE' THEN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+    END IF;
     RETURN NEW;
 END;
 $$ language 'plpgsql';

@@ -1,11 +1,13 @@
 """
 Main collector that orchestrates all scrapers and saves to database
 """
+
 import logging
 from datetime import datetime
 from typing import List, Dict
 from database import init_database, save_case, update_progress, get_statistics
 from mass_gov_scraper import MassGovAppellateScraper, MassGovTrialScraper
+from courtlistener_scraper import CourtListenerScraper
 import config
 
 logger = logging.getLogger(__name__)
@@ -17,8 +19,9 @@ class CaseCollector:
     def __init__(self):
         self.db_client = init_database()
         self.scrapers = [
-            MassGovAppellateScraper(),
-            MassGovTrialScraper(),
+            CourtListenerScraper(),  # Primary source - CourtListener
+            # MassGovAppellateScraper(),  # Disabled for now
+            # MassGovTrialScraper(),  # Disabled for now
         ]
 
     def save_case(self, case_data: Dict) -> bool:
@@ -64,14 +67,21 @@ class CaseCollector:
                     status="completed" if saved_count > 0 else "error",
                 )
 
-                logger.info(
-                    f"Saved {saved_count} new cases from {scraper.source_name}"
-                )
+                logger.info(f"Saved {saved_count} new cases from {scraper.source_name}")
 
             except Exception as e:
                 logger.error(f"Error collecting from {scraper.source_name}: {e}")
                 self.update_progress(scraper.source_name, status="error")
                 continue
+            finally:
+                # Clean up Playwright browser after each scraper
+                if hasattr(scraper, "use_playwright") and scraper.use_playwright:
+                    try:
+                        scraper._close_playwright()
+                    except Exception as e:
+                        logger.debug(
+                            f"Error closing Playwright for {scraper.source_name}: {e}"
+                        )
 
         logger.info(f"Collection complete. Total new cases saved: {total_cases}")
         return total_cases

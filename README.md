@@ -24,6 +24,14 @@ This project collects and organizes all published Massachusetts court cases sinc
 pip install -r requirements.txt
 ```
 
+2. Install Playwright browsers (required for JavaScript-rendered pages):
+
+```bash
+playwright install chromium
+```
+
+See `PLAYWRIGHT_SETUP.md` for detailed setup instructions.
+
 2. Set up Supabase database:
 
    - Go to your Supabase project dashboard

@@ -171,6 +171,16 @@ def save_case(case_data: Dict) -> bool:
         case = CourtCase(**case_data)
         insert_data = case.to_dict()
 
+        # Ensure decision_date is set - use a default if missing
+        if not insert_data.get("decision_date"):
+            # Use today's date as default if no date found
+            from datetime import date
+
+            insert_data["decision_date"] = date.today().isoformat()
+            logger.debug(
+                f"Case {case_data.get('case_name')} has no date, using today as default"
+            )
+
         # Insert into Supabase
         result = client.table("court_cases").insert(insert_data).execute()
 
@@ -242,10 +252,11 @@ def update_progress(
             ),
             "total_cases_collected": total_cases,
             "status": status,
+            # Don't include updated_at - it's handled by the database trigger
         }
 
         if existing.data:
-            # Update existing
+            # Update existing - don't include updated_at
             result = (
                 client.table("collection_progress")
                 .update(progress_data)
