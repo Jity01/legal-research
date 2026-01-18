@@ -5,9 +5,14 @@ Main collector that orchestrates all scrapers and saves to database
 import logging
 from datetime import datetime
 from typing import List, Dict
+import sys
+import os
+
+# Add parent directory to path for config and database imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import init_database, save_case, update_progress, get_statistics
-from mass_gov_scraper import MassGovAppellateScraper, MassGovTrialScraper
-from courtlistener_scraper import CourtListenerScraper
+from .mass_gov_scraper import MassGovAppellateScraper, MassGovTrialScraper
+from .courtlistener_scraper import CourtListenerScraper
 import config
 
 logger = logging.getLogger(__name__)

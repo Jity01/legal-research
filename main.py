@@ -4,7 +4,7 @@ Main entry point for collecting Massachusetts court cases
 import argparse
 import logging
 from datetime import datetime
-from case_collector import CaseCollector
+from scraping.case_collector import CaseCollector
 import config
 
 logging.basicConfig(

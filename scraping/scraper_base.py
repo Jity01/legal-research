@@ -8,6 +8,11 @@ import time
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional
+import sys
+import os
+
+# Add parent directory to path for config and database imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logging.basicConfig(

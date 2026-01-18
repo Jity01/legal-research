@@ -7,7 +7,12 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from bs4 import BeautifulSoup
 import logging
-from scraper_base import BaseScraper
+import sys
+import os
+
+# Add parent directory to path for config imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from .scraper_base import BaseScraper
 import config
 
 logger = logging.getLogger(__name__)
