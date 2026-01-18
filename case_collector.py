@@ -39,7 +39,10 @@ class CaseCollector:
         update_progress(source, last_date, total_cases, status)
 
     def collect_all(
-        self, start_year: int = config.START_YEAR, end_year: int = config.END_YEAR
+        self,
+        start_year: int = config.START_YEAR,
+        end_year: int = config.END_YEAR,
+        max_pages: int = None,
     ):
         """Collect cases from all sources"""
         start_date = datetime(start_year, 1, 1)
@@ -52,7 +55,20 @@ class CaseCollector:
         for scraper in self.scrapers:
             try:
                 logger.info(f"Collecting from {scraper.source_name}")
-                cases = scraper.collect_cases(start_date=start_date, end_date=end_date)
+                # Pass max_pages if scraper supports it
+                if hasattr(scraper, "collect_cases"):
+                    if "max_pages" in scraper.collect_cases.__code__.co_varnames:
+                        cases = scraper.collect_cases(
+                            start_date=start_date,
+                            end_date=end_date,
+                            max_pages=max_pages,
+                        )
+                    else:
+                        cases = scraper.collect_cases(
+                            start_date=start_date, end_date=end_date
+                        )
+                else:
+                    cases = []
 
                 saved_count = 0
                 for case in cases:

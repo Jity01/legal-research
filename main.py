@@ -28,6 +28,8 @@ def main():
                        help='Show collection statistics')
     parser.add_argument('--court-type', type=str, choices=list(config.COURT_TYPES.keys()),
                        help='Filter by specific court type')
+    parser.add_argument('--max-pages', type=int, default=None,
+                       help='Limit number of pages to scrape (for testing)')
     
     args = parser.parse_args()
     
@@ -49,7 +51,7 @@ def main():
     logger.info(f"Date range: {args.start_year} - {args.end_year}")
     
     try:
-        total = collector.collect_all(start_year=args.start_year, end_year=args.end_year)
+        total = collector.collect_all(start_year=args.start_year, end_year=args.end_year, max_pages=args.max_pages)
         logger.info(f"Collection completed. Total cases collected: {total}")
         
         # Show statistics

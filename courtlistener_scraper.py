@@ -194,37 +194,57 @@ class CourtListenerScraper(BaseScraper):
         # Look for pagination - try multiple methods
         next_link = None
         
-        # Method 1: Look for "Next" text
-        next_link = soup.find("a", string=re.compile(r"Next", re.I))
+        # Method 1: Look for "Next" text in links
+        next_link = soup.find("a", string=re.compile(r"^Next$|^>|^»", re.I))
         
-        # Method 2: Look for next button by class
+        # Method 2: Look for next button by class or id
         if not next_link:
             next_link = soup.find("a", class_=re.compile(r"next|pagination.*next", re.I))
+        if not next_link:
+            next_link = soup.find("a", id=re.compile(r"next", re.I))
         
         # Method 3: Look for aria-label
         if not next_link:
             next_link = soup.find("a", {"aria-label": re.compile(r"next", re.I)})
         
-        # Method 4: Look for pagination with page numbers and find "next" or ">"
+        # Method 4: Look for pagination container and find next link
         if not next_link:
-            pagination = soup.find(["nav", "div"], class_=re.compile(r"pagination", re.I))
+            pagination = soup.find(["nav", "div", "ul"], class_=re.compile(r"pagination", re.I))
             if pagination:
+                # Look for next link within pagination
                 next_link = pagination.find("a", string=re.compile(r"Next|>|»", re.I))
+                if not next_link:
+                    # Look for link with "next" in class
+                    next_link = pagination.find("a", class_=re.compile(r"next", re.I))
         
         # Method 5: Look for links with "page=" parameter that's higher than current
         if not next_link:
-            # Try to find current page number
+            # Try to find current page number (default to 1 if not found)
             current_page_match = re.search(r"[?&]page=(\d+)", current_url)
-            if current_page_match:
-                current_page = int(current_page_match.group(1))
-                next_page = current_page + 1
-                # Look for link with next page number
-                page_links = soup.find_all("a", href=re.compile(rf"page={next_page}", re.I))
-                if page_links:
-                    next_link = page_links[0]
+            current_page = int(current_page_match.group(1)) if current_page_match else 1
+            next_page = current_page + 1
+            
+            # Look for link with next page number
+            page_links = soup.find_all("a", href=re.compile(rf"[?&]page={next_page}(?:&|$)", re.I))
+            if page_links:
+                next_link = page_links[0]
+            else:
+                # Try looking for any link with a higher page number
+                all_page_links = soup.find_all("a", href=re.compile(r"[?&]page=\d+", re.I))
+                for link in all_page_links:
+                    href = link.get("href", "")
+                    page_match = re.search(r"[?&]page=(\d+)", href)
+                    if page_match:
+                        page_num = int(page_match.group(1))
+                        if page_num > current_page:
+                            next_link = link
+                            break
 
         if next_link:
             next_url = next_link.get("href", "")
+            if not next_url:
+                return None
+                
             if next_url.startswith("http"):
                 return next_url
             elif next_url.startswith("/"):
@@ -240,6 +260,7 @@ class CourtListenerScraper(BaseScraper):
                 else:
                     return f"{current_url}?{next_url}"
 
+        logger.debug("No next page link found - checking if we're on last page")
         return None
 
     def _parse_date(self, date_str: str) -> Optional[datetime]:
@@ -308,30 +329,53 @@ class CourtListenerScraper(BaseScraper):
                 for case in page_cases:
                     try:
                         # Fetch individual case page for full details
-                        logger.debug(f"Fetching details for: {case.get('case_name')}")
+                        logger.info(f"Fetching details for: {case.get('case_name')} - {case.get('opinion_url')}")
                         case_response = self.fetch_page(case["opinion_url"])
                         if case_response:
                             case_soup = self.parse_html(case_response.text)
                             case_details = self.extract_case_details(case_soup, case["opinion_url"])
                             
+                            logger.debug(f"Extracted details: {case_details}")
+                            
                             # Merge details (case_details override basic info)
                             case.update(case_details)
+                            
+                            # Ensure we have required fields
+                            if not case.get("case_name"):
+                                logger.warning(f"Case missing name, skipping: {case.get('opinion_url')}")
+                                continue
+                            
+                            if not case.get("decision_date"):
+                                logger.warning(f"Case missing date, will use default: {case.get('case_name')}")
                             
                             # Filter by date if provided
                             if start_date or end_date:
                                 if not self.filter_by_date(case, start_date, end_date):
-                                    logger.debug(f"Case {case.get('case_name')} filtered out by date")
+                                    case_year = case.get('decision_date').year if case.get('decision_date') else 'unknown'
+                                    logger.info(f"✗ Filtered out: {case.get('case_name')} (date: {case_year}, filter: {start_date.year}-{end_date.year})")
                                     continue
                             
                             all_cases.append(case)
-                            logger.info(f"Extracted case: {case.get('case_name')} ({case.get('docket_number')})")
+                            logger.info(f"✓ Extracted case: {case.get('case_name')} ({case.get('docket_number')}) - Date: {case.get('decision_date')}")
+                        else:
+                            logger.warning(f"Failed to fetch case page: {case.get('opinion_url')}")
+                            # Still try to add with basic info if date filter passes
+                            if start_date or end_date:
+                                if not self.filter_by_date(case, start_date, end_date):
+                                    continue
+                            all_cases.append(case)
+                            logger.info(f"✓ Added case with basic info: {case.get('case_name')}")
                     except Exception as e:
-                        logger.warning(f"Error fetching case details for {case.get('opinion_url')}: {e}")
-                        # Still add the case with basic info if it passes date filter
-                        if start_date or end_date:
-                            if not self.filter_by_date(case, start_date, end_date):
-                                continue
-                        all_cases.append(case)
+                        logger.error(f"Error processing case {case.get('case_name')}: {e}", exc_info=True)
+                        # Still try to add with basic info if date filter passes
+                        try:
+                            if start_date or end_date:
+                                if not self.filter_by_date(case, start_date, end_date):
+                                    continue
+                            all_cases.append(case)
+                            logger.info(f"✓ Added case after error: {case.get('case_name')}")
+                        except Exception as e2:
+                            logger.error(f"Failed to add case even with basic info: {e2}")
                         continue
 
                     # Small delay between case fetches to be respectful
