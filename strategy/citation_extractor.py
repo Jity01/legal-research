@@ -72,6 +72,71 @@ class CitationExtractor:
             results.append(case)
 
         return results
+    
+    def get_citing_cases_batch(self, case_ids: List[int]) -> Dict[int, List[Dict]]:
+        """
+        Batch fetch citing cases for multiple case IDs.
+        Much more efficient than calling get_citing_cases() multiple times.
+        
+        Returns:
+            Dictionary mapping case_id -> list of citing cases
+        """
+        if not case_ids:
+            return {}
+        
+        client = get_supabase_client()
+        
+        # Get all citations for these cases in one query
+        citations = (
+            client.table("case_citations")
+            .select("citing_case_id, cited_case_id, citation_text, citation_context")
+            .in_("cited_case_id", case_ids)
+            .execute()
+        )
+        
+        if not citations.data:
+            return {case_id: [] for case_id in case_ids}
+        
+        # Get all unique citing case IDs
+        citing_case_ids = list(set(c["citing_case_id"] for c in citations.data if c["citing_case_id"]))
+        
+        if not citing_case_ids:
+            return {case_id: [] for case_id in case_ids}
+        
+        # Fetch all citing cases in one query
+        cases = (
+            client.table("court_cases")
+            .select("id, case_name, citation, docket_number, decision_date, court_name")
+            .in_("id", citing_case_ids)
+            .execute()
+        )
+        
+        # Create maps for quick lookup
+        case_map = {c["id"]: c for c in cases.data} if cases.data else {}
+        result_map = {case_id: [] for case_id in case_ids}
+        
+        # Group citations by (cited_case_id, citing_case_id) to avoid duplicates
+        citation_groups = {}
+        for citation in citations.data:
+            cited_case_id = citation["cited_case_id"]
+            citing_case_id = citation["citing_case_id"]
+            key = (cited_case_id, citing_case_id)
+            
+            if key not in citation_groups:
+                citation_groups[key] = []
+            citation_groups[key].append({
+                "text": citation.get("citation_text"),
+                "context": citation.get("citation_context"),
+            })
+        
+        # Build result map with all citation contexts for each case
+        for (cited_case_id, citing_case_id), contexts in citation_groups.items():
+            if cited_case_id in result_map and citing_case_id in case_map:
+                case_data = case_map[citing_case_id].copy()
+                case_data["citation_contexts"] = contexts
+                result_map[cited_case_id].append(case_data)
+        
+        return result_map
 
     def match_citation_to_case(self, citation_text: str) -> Optional[int]:
         """

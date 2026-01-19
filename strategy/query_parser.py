@@ -6,11 +6,14 @@ Extracts all distinct legal principles from the query with full context.
 import logging
 from typing import Dict, List, Optional
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Rate limiter removed - no retries, fail fast
 
 
 class QueryParser:
@@ -42,9 +45,10 @@ class QueryParser:
             return self._parse_fallback(query)
 
     def _parse_with_llm(self, query: str) -> Dict:
-        """Use OpenAI to parse the query"""
+        """Use OpenAI to parse the query with rate limit handling"""
         try:
             from openai import OpenAI
+            import time
 
             client = OpenAI(api_key=self.api_key)
 
@@ -93,36 +97,55 @@ Return your response as JSON in this exact format:
 
 Extract ALL distinct legal principles from the query - do not miss any, no matter how small."""
 
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a legal research assistant. Always return valid JSON. Extract ALL distinct legal principles from the query with full context. Each factor must be self-contained and state the legal principle in the context mentioned in the query. Use the EXACT verbiage from the query - do not rephrase or assume specifics that aren't explicitly stated. Do not assume what the user is searching for - just state the legal principles in the context provided using the query's exact wording.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-            )
+            # Make request without retries - fail fast
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a legal research assistant. Always return valid JSON. Extract ALL distinct legal principles from the query with full context. Each factor must be self-contained and state the legal principle in the context mentioned in the query. Use the EXACT verbiage from the query - do not rephrase or assume specifics that aren't explicitly stated. Do not assume what the user is searching for - just state the legal principles in the context provided using the query's exact wording.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
 
-            import json
+                import json
 
-            result = json.loads(response.choices[0].message.content)
+                result = json.loads(response.choices[0].message.content)
 
-            # Validate
-            if "factors" not in result or len(result["factors"]) == 0:
-                logger.warning("LLM didn't return any factors, using fallback")
-                return self._parse_fallback(query)
+                # Validate
+                if "factors" not in result or len(result["factors"]) == 0:
+                    logger.warning("LLM didn't return any factors, using fallback")
+                    return self._parse_fallback(query)
 
-            # Ensure query_type exists
-            if "query_type" not in result:
-                result["query_type"] = "neutral"
+                # Ensure query_type exists
+                if "query_type" not in result:
+                    result["query_type"] = "neutral"
 
-            return result
+                return result
+
+            except Exception as api_error:
+                error_str = str(api_error).lower()
+                # Check if it's a rate limit or quota error - fall back immediately
+                if (
+                    "429" in error_str
+                    or "rate limit" in error_str
+                    or "quota" in error_str
+                    or "insufficient_quota" in error_str
+                ):
+                    logger.warning(
+                        f"Rate limit/quota hit in query parser, using fallback immediately: {error_str}"
+                    )
+                    return self._parse_fallback(query)
+                else:
+                    # Non-rate-limit error, re-raise
+                    raise
 
         except Exception as e:
-            logger.error(f"Error parsing query with LLM: {e}")
+            logger.warning(f"Error parsing query with LLM: {e}, using fallback")
             return self._parse_fallback(query)
 
     def _parse_fallback(self, query: str) -> Dict:
