@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from strategy.similarity_matcher import SimilarityMatcher
 from strategy.citation_extractor import CitationExtractor
+from strategy.query_parser import QueryParser
 from database import get_case_by_id
 
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +44,7 @@ similarity_matcher = SimilarityMatcher(
     max_workers=5, use_llm=True, cases_per_batch=10, db_batch_size=50
 )
 citation_extractor = CitationExtractor()
+query_parser = QueryParser()
 
 
 @app.route("/")
@@ -186,6 +188,29 @@ def search_stream():
 
     except Exception as e:
         logger.error(f"Error in streaming search endpoint: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/validate-query", methods=["POST"])
+def validate_query():
+    """Validate a query and ask clarifying questions if needed"""
+    try:
+        data = request.get_json()
+        query = data.get("query", "")
+        previous_answers = data.get("previous_answers", [])
+
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+
+        logger.info(f"Validating query: {query}, previous answers: {previous_answers}")
+
+        # Validate the query
+        validation_result = query_parser.validate_query(query, previous_answers)
+
+        return jsonify(validation_result)
+
+    except Exception as e:
+        logger.error(f"Error validating query: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 

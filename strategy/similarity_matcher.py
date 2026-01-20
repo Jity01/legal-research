@@ -131,24 +131,87 @@ class SimilarityMatcher:
         )
 
         # Get factors and holdings in parallel (faster)
-        # Use batch queries to reduce round trips
+        # Use batch queries to reduce round trips and handle Supabase .in_() limits
         import concurrent.futures
+        import httpx
+
+        def execute_with_retry(query_func, max_retries=3, initial_delay=1):
+            """Execute a database query with retry logic for connection errors"""
+            for attempt in range(max_retries):
+                try:
+                    return query_func()
+                except (
+                    httpx.RemoteProtocolError,
+                    httpx.ConnectError,
+                    httpx.ReadTimeout,
+                ) as e:
+                    if attempt < max_retries - 1:
+                        delay = initial_delay * (2**attempt)  # Exponential backoff
+                        logger.warning(
+                            f"Database connection error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {delay}s..."
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error(
+                            f"Database connection failed after {max_retries} attempts: {e}"
+                        )
+                        raise
+                except Exception as e:
+                    # Don't retry on non-connection errors
+                    raise
 
         def fetch_factors():
-            return (
-                client.table("case_factors")
-                .select("case_id, factor_text")
-                .in_("case_id", candidate_case_ids)
-                .execute()
-            )
+            # Supabase .in_() has limits (~100-200 items), so batch the queries
+            all_factors_data = []
+            batch_size = 100  # Safe batch size for .in_() queries
+
+            for i in range(0, len(candidate_case_ids), batch_size):
+                batch_ids = candidate_case_ids[i : i + batch_size]
+
+                def execute_batch():
+                    return (
+                        client.table("case_factors")
+                        .select("case_id, factor_text")
+                        .in_("case_id", batch_ids)
+                        .execute()
+                    )
+
+                batch_result = execute_with_retry(execute_batch)
+                if batch_result.data:
+                    all_factors_data.extend(batch_result.data)
+
+            # Create a mock response object with .data attribute
+            class MockResponse:
+                def __init__(self, data):
+                    self.data = data
+
+            return MockResponse(all_factors_data)
 
         def fetch_holdings():
-            return (
-                client.table("case_holdings")
-                .select("case_id, holding_direction")
-                .in_("case_id", candidate_case_ids)
-                .execute()
-            )
+            # Batch holdings fetch as well
+            all_holdings_data = []
+            batch_size = 100
+
+            for i in range(0, len(candidate_case_ids), batch_size):
+                batch_ids = candidate_case_ids[i : i + batch_size]
+
+                def execute_batch():
+                    return (
+                        client.table("case_holdings")
+                        .select("case_id, holding_direction")
+                        .in_("case_id", batch_ids)
+                        .execute()
+                    )
+
+                batch_result = execute_with_retry(execute_batch)
+                if batch_result.data:
+                    all_holdings_data.extend(batch_result.data)
+
+            class MockResponse:
+                def __init__(self, data):
+                    self.data = data
+
+            return MockResponse(all_holdings_data)
 
         # Fetch in parallel
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -158,15 +221,19 @@ class SimilarityMatcher:
             all_factors = factors_future.result()
             holdings = holdings_future.result()
 
-        holding_map = {h["case_id"]: h["holding_direction"] for h in holdings.data}
+        # Initialize holding_map with all candidate cases (default to "unclear" if no holding)
+        holding_map = {case_id: "unclear" for case_id in candidate_case_ids}
+        for h in holdings.data:
+            holding_map[h["case_id"]] = h["holding_direction"]
+
+        # Initialize case_factors_map with ALL candidate cases (including those without factors)
+        case_factors_map = {case_id: [] for case_id in candidate_case_ids}
 
         # Group factors by case
-        case_factors_map = {}
         for factor in all_factors.data:
             case_id = factor["case_id"]
-            if case_id not in case_factors_map:
-                case_factors_map[case_id] = []
-            case_factors_map[case_id].append({"text": factor["factor_text"]})
+            if case_id in case_factors_map:
+                case_factors_map[case_id].append({"text": factor["factor_text"]})
 
         # STAGE 2: Batch fetch case details and process in parallel
         logger.debug(f"Stage 2: Processing {len(case_factors_map)} cases in batches...")
@@ -217,9 +284,15 @@ class SimilarityMatcher:
         if not top_case_ids:
             return []
 
-        cases = (
-            client.table("court_cases").select("*").in_("id", top_case_ids).execute()
-        )
+        def execute_cases_query():
+            return (
+                client.table("court_cases")
+                .select("*")
+                .in_("id", top_case_ids)
+                .execute()
+            )
+
+        cases = execute_with_retry(execute_cases_query)
 
         # Create a map for quick lookup
         case_map = {c["id"]: c for c in cases.data}
@@ -232,6 +305,9 @@ class SimilarityMatcher:
                 case_data = case_map[case_id].copy()
                 case_data["similarity_score"] = scored_case["similarity_score"]
                 case_data["holding_direction"] = scored_case["holding_direction"]
+                # Include justification if available
+                if "justification" in scored_case:
+                    case_data["justification"] = scored_case["justification"]
                 results.append(case_data)
 
         logger.info(
@@ -358,17 +434,20 @@ class SimilarityMatcher:
                 try:
                     # Supabase ILIKE requires the pattern without % signs in the method call
                     # The % are added automatically by Supabase
-                    query = (
-                        client.table("case_factors")
-                        .select("case_id, factor_text")
-                        .ilike("factor_text", f"%{primary_keyword}%")
-                    )
-                    # Only apply limit if specified - otherwise get ALL factors
-                    if candidate_limit is not None:
-                        # If we have a limit, we still want to check a large pool of factors
-                        # Use a much larger limit to ensure we don't miss matches
-                        query = query.limit(max(candidate_limit * 20, 10000))
-                    all_factors = query.execute()
+                    def execute_factors_query():
+                        query = (
+                            client.table("case_factors")
+                            .select("case_id, factor_text")
+                            .ilike("factor_text", f"%{primary_keyword}%")
+                        )
+                        # Only apply limit if specified - otherwise get ALL factors
+                        if candidate_limit is not None:
+                            # If we have a limit, we still want to check a large pool of factors
+                            # Use a much larger limit to ensure we don't miss matches
+                            query = query.limit(max(candidate_limit * 20, 10000))
+                        return query.execute()
+
+                    all_factors = execute_with_retry(execute_factors_query)
                 except Exception as query_error:
                     logger.debug(
                         f"ILIKE query failed: {query_error}, using simple text search"
@@ -638,9 +717,9 @@ LEGAL PRINCIPLES FROM THIS CASE:
 ---
 """
 
-            prompt = f"""You are evaluating whether a lawyer conducting legal research would be interested in these cases based on the legal principles they are researching.
+            prompt = f"""You are evaluating whether these cases match the search query based on the legal principles mentioned in the query.
 
-Legal Principles the Lawyer is Researching:
+Legal Principles from the Search Query:
 {combined_query}
 
 CASES TO EVALUATE:
@@ -650,7 +729,7 @@ CRITICAL INSTRUCTIONS:
 - Evaluate EACH case separately - do NOT confuse or mix up cases
 - Each case is clearly marked with "=== CASE X ===" and has a unique CASE ID
 - Pay close attention to the CASE ID and CASE NAME to keep cases distinct
-- For each case, determine if it would be relevant for the lawyer's research
+- For each case, determine if it matches the search query based on the legal principles
 
 CRITICAL SCORING INSTRUCTIONS - SHOW YOUR SELECTIVITY IN THE NUMBERS:
 - Be EXTREMELY SELECTIVE - your selectivity must be reflected in the actual score you assign
@@ -667,12 +746,13 @@ Return a JSON object with:
   Each object should have:
     - "case_id": the integer case ID (must match exactly from the case above)
     - "similarity_score": a float between 0.0 and 1.0 that REFLECTS your selectivity level
+    - "justification": a brief explanation (2-3 sentences) of why you assigned this score, explaining how the legal principles from the case relate (or don't relate) to the search query. Write directly about the search query - do not refer to "the user", "the lawyer", or any person in third person.
 
 Example format:
 {{
   "case_scores": [
-    {{"case_id": 123, "similarity_score": 0.85}},
-    {{"case_id": 456, "similarity_score": 0.02}},
+    {{"case_id": 123, "similarity_score": 0.85, "justification": "This case directly addresses the same legal principle about asylum eligibility based on past persecution, where the court found that the applicant demonstrated a well-founded fear of future persecution based on the same type of harm."}},
+    {{"case_id": 456, "similarity_score": 0.02, "justification": "This case involves completely different legal principles related to criminal procedure and evidence, with no overlap to the asylum-related legal principles mentioned in the search query."}},
     ...
   ]
 }}
@@ -686,7 +766,7 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are a legal research assistant helping a lawyer find relevant cases. Be EXTREMELY selective - your selectivity must be visible in the scores you assign. If legal principles are fundamentally different, give VERY LOW scores (0.00-0.05). If they're somewhat related, give LOW scores (0.05-0.20). Only give high scores (0.50+) for closely related legal principles. Show your strict selectivity in the numbers - unrelated cases should get scores like 0.01-0.05, not 0.10. Return only valid JSON. Pay close attention to case IDs to keep cases distinct.",
+                            "content": "You are a legal research assistant matching cases to search queries. Be EXTREMELY selective - your selectivity must be visible in the scores you assign. If legal principles are fundamentally different, give VERY LOW scores (0.00-0.05). If they're somewhat related, give LOW scores (0.05-0.20). Only give high scores (0.50+) for closely related legal principles. Show your strict selectivity in the numbers - unrelated cases should get scores like 0.01-0.05, not 0.10. For each case, provide a clear justification (2-3 sentences) explaining your reasoning. Write justifications directly about the search query - do not refer to 'the user', 'the lawyer', or any person in third person. Return only valid JSON. Pay close attention to case IDs to keep cases distinct.",
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -703,6 +783,9 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                     case_data["case_id"]: case_data for case_data in batch_data
                 }
 
+                # Track the 19 new cases (IDs 537-555) for logging
+                NEW_CASE_IDS = set(range(537, 556))
+
                 for score_data in case_scores:
                     case_id = score_data.get("case_id")
                     if case_id and case_id in case_id_to_data:
@@ -710,6 +793,23 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                         similarity_score = float(
                             score_data.get("similarity_score", 0.0)
                         )
+                        justification = score_data.get(
+                            "justification", "No justification provided"
+                        )
+
+                        # Log justification for the 19 new cases
+                        if case_id in NEW_CASE_IDS:
+                            case_name = case_data.get("case_details", {}).get(
+                                "case_name", f"Case {case_id}"
+                            )
+                            logger.info(
+                                f"\n{'='*80}\n"
+                                f"LLM JUDGE OPINION - Case ID: {case_id}\n"
+                                f"Case Name: {case_name}\n"
+                                f"Similarity Score: {similarity_score:.3f}\n"
+                                f"Justification:\n{justification}\n"
+                                f"{'='*80}\n"
+                            )
 
                         if similarity_score > 0:
                             results.append(
@@ -717,6 +817,7 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                                     "case_id": case_id,
                                     "similarity_score": similarity_score,
                                     "holding_direction": case_data["holding_direction"],
+                                    "justification": justification,
                                 }
                             )
 
