@@ -16,17 +16,17 @@ def verify_cases():
     
     # First, check if we can access the table
     try:
-        test_result = client.table("court_cases").select("id").limit(1).execute()
-        print("✓ Successfully connected to court_cases table\n")
+        test_result = client.table("cases").select("id").limit(1).execute()
+        print("✓ Successfully connected to cases table\n")
     except Exception as e:
-        print(f"✗ Error accessing court_cases table: {e}")
+        print(f"✗ Error accessing cases table: {e}")
         return
     
     # Check by source (user_input)
     print("Checking cases with source='user_input'...")
     try:
         result = (
-            client.table("court_cases")
+            client.table("cases")
             .select("id, case_name, citation, docket_number, court_name, decision_date, source")
             .eq("source", "user_input")
             .order("id")
@@ -43,7 +43,7 @@ def verify_cases():
             # Try by ID range
             all_ids = list(range(537, 556))
             result = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id, case_name, citation, docket_number, court_name, decision_date, source")
                 .in_("id", all_ids)
                 .order("id")
@@ -76,7 +76,7 @@ def verify_cases():
         # Get opinion text length
         try:
             case_detail = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("opinion_text")
                 .eq("id", case_id)
                 .single()
@@ -89,7 +89,7 @@ def verify_cases():
         # Check analysis metadata
         try:
             metadata = (
-                client.table("case_analysis_metadata")
+                client.table("cases_analysis_metadata")
                 .select("is_analyzed, analyzed_at")
                 .eq("case_id", case_id)
                 .execute()
@@ -103,7 +103,7 @@ def verify_cases():
         # Count factors
         try:
             factors = (
-                client.table("case_factors")
+                client.table("cases_factors")
                 .select("id", count="exact")
                 .eq("case_id", case_id)
                 .execute()
@@ -115,7 +115,7 @@ def verify_cases():
         # Count holdings
         try:
             holdings = (
-                client.table("case_holdings")
+                client.table("cases_holdings")
                 .select("id")
                 .eq("case_id", case_id)
                 .execute()

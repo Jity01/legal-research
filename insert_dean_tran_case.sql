@@ -2,16 +2,16 @@
 -- Run this in your Supabase SQL editor
 
 -- First, delete all related data (cascade should handle this, but being explicit)
-DELETE FROM case_factors;
-DELETE FROM case_holdings;
-DELETE FROM case_citations;
-DELETE FROM case_analysis_metadata;
+DELETE FROM cases_factors;
+DELETE FROM cases_holdings;
+DELETE FROM cases_citations;
+DELETE FROM cases_analysis_metadata;
 
 -- Delete all cases
-DELETE FROM court_cases;
+DELETE FROM cases;
 
 -- Insert the Dean Tran case
-INSERT INTO court_cases (
+INSERT INTO cases (
     case_name,
     docket_number,
     citation,
@@ -255,5 +255,5 @@ Brewster, 408 U.S. at 512.$OPINION_TEXT$,
 
 -- Verify the insertion
 SELECT id, case_name, docket_number, court_type, decision_date 
-FROM court_cases 
+FROM cases 
 WHERE case_name = 'DEAN TRAN vs. COMMONWEALTH';

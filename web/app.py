@@ -29,6 +29,11 @@ from database import get_case_by_id
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Suppress verbose HTTP logs from httpx and openai
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("openai._base_client").setLevel(logging.WARNING)
+
 # Get the directory where this file is located
 web_dir = os.path.dirname(os.path.abspath(__file__))
 app = Flask(
@@ -37,11 +42,16 @@ app = Flask(
     static_folder=os.path.join(web_dir, "static"),
 )
 
-# Initialize components with optimized settings
-# Process 10 cases per LLM call with 5 concurrent workers
-# Fetches cases in batches of 50 from database
+# Initialize components - configured for xAI (480 RPM, 30k TPM)
+# Uses fts_vector prefiltering to reduce 99k cases → 20k before LLM calls
 similarity_matcher = SimilarityMatcher(
-    max_workers=5, use_llm=True, cases_per_batch=10, db_batch_size=50
+    max_workers=40,  # xAI: 480 RPM supports 40+ workers
+    use_llm=True,
+    cases_per_batch=40,  # xAI: 30k TPM supports 40 cases per batch
+    db_batch_size=50,
+    text_prefilter_size=20000,  # Prefilter to top 20k cases with fts_vector similarity
+    max_rpm=480,  # xAI: 480 RPM
+    max_tpm=30000,  # Keep same TPM limit
 )
 citation_extractor = CitationExtractor()
 query_parser = QueryParser()
@@ -214,8 +224,8 @@ def validate_query():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/case/<int:case_id>")
-def get_case(case_id: int):
+@app.route("/api/case/<case_id>")
+def get_case(case_id: str):
     """Get full case details"""
     try:
         case = get_case_by_id(case_id)

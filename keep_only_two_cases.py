@@ -22,7 +22,7 @@ def keep_only_two_cases(case_id_1: int, case_id_2: int):
     client = get_supabase_client()
 
     # Get all case IDs
-    all_cases = client.table("court_cases").select("id").execute()
+    all_cases = client.table("cases").select("id").execute()
 
     if not all_cases.data:
         print("No cases found in database.")
@@ -48,20 +48,20 @@ def keep_only_two_cases(case_id_1: int, case_id_2: int):
         batch = case_ids_to_delete[i : i + batch_size]
         try:
             # Delete related data first (cascade should handle this, but be explicit)
-            client.table("case_factors").delete().in_("case_id", batch).execute()
-            client.table("case_holdings").delete().in_("case_id", batch).execute()
-            client.table("case_citations").delete().in_(
+            client.table("cases_factors").delete().in_("case_id", batch).execute()
+            client.table("cases_holdings").delete().in_("case_id", batch).execute()
+            client.table("cases_citations").delete().in_(
                 "citing_case_id", batch
             ).execute()
-            client.table("case_citations").delete().in_(
+            client.table("cases_citations").delete().in_(
                 "cited_case_id", batch
             ).execute()
-            client.table("case_analysis_metadata").delete().in_(
+            client.table("cases_analysis_metadata").delete().in_(
                 "case_id", batch
             ).execute()
 
             # Delete the cases themselves
-            client.table("court_cases").delete().in_("id", batch).execute()
+            client.table("cases").delete().in_("id", batch).execute()
             deleted_count += len(batch)
             print(f"Deleted {deleted_count}/{len(case_ids_to_delete)} cases...")
         except Exception as e:
@@ -72,7 +72,7 @@ def keep_only_two_cases(case_id_1: int, case_id_2: int):
     print(f"Remaining cases: {case_id_1} and {case_id_2}")
 
     # Verify
-    remaining = client.table("court_cases").select("id, case_name").execute()
+    remaining = client.table("cases").select("id, case_name").execute()
 
     print("\nRemaining cases:")
     for case in remaining.data:

@@ -30,7 +30,7 @@ class CitationExtractor:
 
         # Get all citations that reference this case
         citations = (
-            client.table("case_citations")
+            client.table("cases_citations")
             .select("citing_case_id, citation_text, citation_context")
             .eq("cited_case_id", case_id)
             .execute()
@@ -46,7 +46,7 @@ class CitationExtractor:
             return []
 
         cases = (
-            client.table("court_cases")
+            client.table("cases")
             .select("id, case_name, citation, docket_number, decision_date, court_name")
             .in_("id", citing_case_ids)
             .execute()
@@ -88,7 +88,7 @@ class CitationExtractor:
         
         # Get all citations for these cases in one query
         citations = (
-            client.table("case_citations")
+            client.table("cases_citations")
             .select("citing_case_id, cited_case_id, citation_text, citation_context")
             .in_("cited_case_id", case_ids)
             .execute()
@@ -105,7 +105,7 @@ class CitationExtractor:
         
         # Fetch all citing cases in one query
         cases = (
-            client.table("court_cases")
+            client.table("cases")
             .select("id, case_name, citation, docket_number, decision_date, court_name")
             .in_("id", citing_case_ids)
             .execute()
@@ -165,7 +165,7 @@ class CitationExtractor:
                 return None
 
             result = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id")
                 .ilike("citation", f"%{clean_citation}%")
                 .limit(1)

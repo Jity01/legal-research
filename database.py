@@ -29,7 +29,7 @@ def init_database():
     try:
         client = get_supabase_client()
         # Test connection by checking if tables exist
-        result = client.table("court_cases").select("id").limit(1).execute()
+        result = client.table("cases").select("id").limit(1).execute()
         logger.info("Successfully connected to Supabase")
         return client
     except Exception as e:
@@ -149,7 +149,7 @@ def save_case(case_data: Dict) -> bool:
         # Check if case already exists
         if case_data.get("docket_number") and case_data.get("decision_date"):
             existing = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id")
                 .eq("docket_number", case_data["docket_number"])
                 .eq(
@@ -182,7 +182,7 @@ def save_case(case_data: Dict) -> bool:
             )
 
         # Insert into Supabase
-        result = client.table("court_cases").insert(insert_data).execute()
+        result = client.table("cases").insert(insert_data).execute()
 
         if result.data:
             logger.info(f"Saved case: {case_data.get('case_name')}")
@@ -200,7 +200,7 @@ def get_case_by_id(case_id: int) -> Optional[Dict]:
     """Get a case by ID"""
     try:
         client = get_supabase_client()
-        result = client.table("court_cases").select("*").eq("id", case_id).execute()
+        result = client.table("cases").select("*").eq("id", case_id).execute()
         if result.data:
             return result.data[0]
         return None
@@ -214,7 +214,7 @@ def get_cases_by_court(court_type: str, limit: int = 100) -> List[Dict]:
     try:
         client = get_supabase_client()
         result = (
-            client.table("court_cases")
+            client.table("cases")
             .select("*")
             .eq("court_type", court_type)
             .limit(limit)
@@ -279,7 +279,7 @@ def get_statistics() -> Dict:
         client = get_supabase_client()
 
         # Get total count
-        total_result = client.table("court_cases").select("id", count="exact").execute()
+        total_result = client.table("cases").select("id", count="exact").execute()
         total_cases = (
             total_result.count
             if hasattr(total_result, "count")
@@ -290,7 +290,7 @@ def get_statistics() -> Dict:
         by_court = {}
         for court_type in config.COURT_TYPES.keys():
             result = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id", count="exact")
                 .eq("court_type", court_type)
                 .execute()

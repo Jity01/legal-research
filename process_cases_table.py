@@ -36,7 +36,7 @@ lock = threading.Lock()
 
 def map_case_schema(source_case: Dict) -> Dict:
     """
-    Map from 'cases' table schema to 'court_cases' table schema.
+    Map from 'cases' table schema to 'cases' table schema (for compatibility).
 
     Source schema (cases):
     - id (text)
@@ -49,7 +49,7 @@ def map_case_schema(source_case: Dict) -> Dict:
     - url (text)
     - summary (text)
 
-    Target schema (court_cases):
+    Target schema (cases):
     - case_name (required)
     - opinion_text (from full_text)
     - citation
@@ -144,10 +144,10 @@ def infer_court_type(court_name: str) -> str:
     return "UNKNOWN"
 
 
-def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
+def get_or_create_court_case(client, mapped_case: Dict) -> Optional[str]:
     """
-    Check if case exists in court_cases, if not create it.
-    Returns the court_cases.id (bigint) or None if creation failed.
+    Check if case exists in cases, if not create it.
+    Returns the cases.id (text) or None if creation failed.
     """
     try:
         # Try to find existing case by case_name + decision_date or citation
@@ -159,7 +159,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
         # Check by citation first (most reliable)
         if citation:
             existing = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id, opinion_text")
                 .eq("citation", citation)
                 .limit(1)
@@ -172,7 +172,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
                     "opinion_text"
                 ):
                     try:
-                        client.table("court_cases").update(
+                        client.table("cases").update(
                             {"opinion_text": mapped_case["opinion_text"]}
                         ).eq("id", case_id).execute()
                         logger.debug(f"Updated opinion_text for case {case_id}")
@@ -185,7 +185,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
         # Check by docket_number + decision_date
         if docket_number and decision_date:
             existing = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id, opinion_text")
                 .eq("docket_number", docket_number)
                 .eq("decision_date", decision_date)
@@ -199,7 +199,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
                     "opinion_text"
                 ):
                     try:
-                        client.table("court_cases").update(
+                        client.table("cases").update(
                             {"opinion_text": mapped_case["opinion_text"]}
                         ).eq("id", case_id).execute()
                         logger.debug(f"Updated opinion_text for case {case_id}")
@@ -212,7 +212,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
         # Check by case_name + decision_date
         if case_name and decision_date:
             existing = (
-                client.table("court_cases")
+                client.table("cases")
                 .select("id, opinion_text")
                 .eq("case_name", case_name)
                 .eq("decision_date", decision_date)
@@ -226,7 +226,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
                     "opinion_text"
                 ):
                     try:
-                        client.table("court_cases").update(
+                        client.table("cases").update(
                             {"opinion_text": mapped_case["opinion_text"]}
                         ).eq("id", case_id).execute()
                         logger.debug(f"Updated opinion_text for case {case_id}")
@@ -243,7 +243,7 @@ def get_or_create_court_case(client, mapped_case: Dict) -> Optional[int]:
 
             mapped_case["decision_date"] = date.today().isoformat()
 
-        result = client.table("court_cases").insert(mapped_case).execute()
+        result = client.table("cases").insert(mapped_case).execute()
         if result.data and len(result.data) > 0:
             return result.data[0]["id"]
         return None
@@ -288,7 +288,7 @@ def process_single_case(
         # Check if already analyzed (unless force)
         if not force:
             existing = (
-                client.table("case_analysis_metadata")
+                client.table("cases_analysis_metadata")
                 .select("id")
                 .eq("case_id", court_case_id)
                 .eq("is_analyzed", True)
@@ -314,7 +314,7 @@ def process_single_case(
         if analysis.get("factors"):
             # Delete existing factors first
             try:
-                client.table("case_factors").delete().eq(
+                client.table("cases_factors").delete().eq(
                     "case_id", court_case_id
                 ).execute()
             except:
@@ -341,7 +341,7 @@ def process_single_case(
             if factors_data:
                 try:
                     # Bulk insert
-                    client.table("case_factors").insert(factors_data).execute()
+                    client.table("cases_factors").insert(factors_data).execute()
                 except Exception as e:
                     logger.debug(
                         f"Error inserting factors for case {court_case_id}: {e}"
@@ -359,18 +359,18 @@ def process_single_case(
 
             try:
                 existing_holding = (
-                    client.table("case_holdings")
+                    client.table("cases_holdings")
                     .select("id")
                     .eq("case_id", court_case_id)
                     .execute()
                 )
 
                 if existing_holding.data:
-                    client.table("case_holdings").update(holding_data).eq(
+                    client.table("cases_holdings").update(holding_data).eq(
                         "case_id", court_case_id
                     ).execute()
                 else:
-                    client.table("case_holdings").insert(holding_data).execute()
+                    client.table("cases_holdings").insert(holding_data).execute()
             except Exception as e:
                 logger.debug(f"Error saving holding for case {court_case_id}: {e}")
 
@@ -405,14 +405,14 @@ def process_single_case(
                 # Insert one at a time to handle duplicates gracefully
                 for cit_data in citations_data:
                     try:
-                        client.table("case_citations").insert(cit_data).execute()
+                        client.table("cases_citations").insert(cit_data).execute()
                     except:
                         pass  # Skip duplicates
 
         # Mark as analyzed
         try:
             existing_metadata = (
-                client.table("case_analysis_metadata")
+                client.table("cases_analysis_metadata")
                 .select("id")
                 .eq("case_id", court_case_id)
                 .execute()
@@ -425,11 +425,11 @@ def process_single_case(
             }
 
             if existing_metadata.data:
-                client.table("case_analysis_metadata").update(metadata_data).eq(
+                client.table("cases_analysis_metadata").update(metadata_data).eq(
                     "case_id", court_case_id
                 ).execute()
             else:
-                client.table("case_analysis_metadata").insert(metadata_data).execute()
+                client.table("cases_analysis_metadata").insert(metadata_data).execute()
         except Exception as e:
             logger.debug(f"Error saving metadata for case {court_case_id}: {e}")
 
@@ -448,7 +448,7 @@ def process_single_case(
         try:
             if court_case_id:
                 existing_metadata = (
-                    client.table("case_analysis_metadata")
+                    client.table("cases_analysis_metadata")
                     .select("id")
                     .eq("case_id", court_case_id)
                     .execute()
@@ -461,11 +461,11 @@ def process_single_case(
                 }
 
                 if existing_metadata.data:
-                    client.table("case_analysis_metadata").update(error_data).eq(
+                    client.table("cases_analysis_metadata").update(error_data).eq(
                         "case_id", court_case_id
                     ).execute()
                 else:
-                    client.table("case_analysis_metadata").insert(error_data).execute()
+                    client.table("cases_analysis_metadata").insert(error_data).execute()
         except:
             pass
 

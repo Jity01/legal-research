@@ -78,7 +78,7 @@ def update_and_reprocess_case(case_id: int, case_text: str):
     
     # First, update the opinion_text in the database
     try:
-        result = client.table("court_cases").update({
+        result = client.table("cases").update({
             "opinion_text": case_text
         }).eq("id", case_id).execute()
         
@@ -93,7 +93,7 @@ def update_and_reprocess_case(case_id: int, case_text: str):
     
     # Now get the full case data and re-process
     try:
-        case_result = client.table("court_cases").select("*").eq("id", case_id).single().execute()
+        case_result = client.table("cases").select("*").eq("id", case_id).single().execute()
         case_data = case_result.data
         
         # Convert to the format expected by process_single_case
