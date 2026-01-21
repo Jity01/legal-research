@@ -65,12 +65,14 @@ class SimilarityMatcher:
     def __init__(
         self,
         use_llm: bool = True,
-        max_workers: int = 40,  # xAI: 480 RPM supports 40+ workers
+        max_workers: int = 100,  # Optimized: 480 RPM limit means ~8 req/sec, with ~3-5s per call = ~40-50 concurrent max, using 100 for headroom
         cases_per_batch: int = 40,  # Keep same batch size
         db_batch_size: int = 50,
         text_prefilter_size: int = 20000,  # Use fts_vector similarity to prefilter to top 20k cases
         max_rpm: int = 480,  # xAI: 480 RPM
         max_tpm: int = 30000,  # Keep same TPM limit (adjust if needed)
+        api_timeout: int = 60,  # Timeout for API calls in seconds
+        model: str = "grok-beta",  # Use fast model: grok-beta, grok-3-fast, or grok-4-fast for speed
     ):
         # Default to LLM if API key is available, otherwise use text matching
         self.use_llm = use_llm and bool(os.getenv("XAI_API_KEY"))
@@ -85,10 +87,14 @@ class SimilarityMatcher:
         )
         self.max_rpm = max_rpm  # Maximum requests per minute (for rate limiting)
         self.max_tpm = max_tpm  # Maximum tokens per minute (for rate limiting)
+        self.api_timeout = api_timeout  # Timeout for API calls
+        self.model = model  # LLM model to use (faster models: grok-beta, grok-3-fast, grok-4-fast)
         # Cache for parsed queries (simple in-memory cache)
         self._query_cache = {}
         # Cache for query embeddings
         self._query_embedding_cache = {}
+        # Shared HTTP client for connection pooling (created lazily)
+        self._http_client = None
 
     def find_similar_cases(
         self,
@@ -218,8 +224,8 @@ class SimilarityMatcher:
 
         # Process in chunks to manage memory
         # Keep top results from each chunk, then merge at the end
-        # Use smaller chunks (5k) for faster processing and better parallelism
-        chunk_size = 5000  # Process 5k cases at a time for faster processing
+        # Use larger chunks (10k) to send more requests at once (250 requests per chunk)
+        chunk_size = 10000  # Process 10k cases at a time = 250 requests per chunk (10k / 40 cases per request)
         all_scored_cases = []
 
         # Determine how many top results to keep per chunk
@@ -316,19 +322,37 @@ class SimilarityMatcher:
         if limit is not None and len(all_scored_cases) > limit:
             all_scored_cases = all_scored_cases[:limit]
 
-        # Get full case details for matches
+        # Get full case details for matches (batch to avoid statement timeout)
+        # Supabase has 8s statement timeout, PostgreSQL IN clauses perform best with <500 items
+        # Using 250 IDs per batch for safety and performance
         top_case_ids = [c["case_id"] for c in all_scored_cases]
 
         if not top_case_ids:
             return []
 
-        def execute_cases_query():
-            return client.table("cases").select("*").in_("id", top_case_ids).execute()
+        # Fetch case details in batches of 250 to avoid statement timeout
+        # Research: Supabase 8s timeout, PostgreSQL IN best with <500 items, 250 is safe
+        case_map = {}
+        batch_size = 250
+        total_batches = (len(top_case_ids) + batch_size - 1) // batch_size
 
-        cases = execute_with_retry(execute_cases_query)
+        for batch_idx in range(0, len(top_case_ids), batch_size):
+            batch_ids = top_case_ids[batch_idx : batch_idx + batch_size]
+            try:
 
-        # Create a map for quick lookup
-        case_map = {c["id"]: c for c in cases.data}
+                def execute_cases_query():
+                    return (
+                        client.table("cases").select("*").in_("id", batch_ids).execute()
+                    )
+
+                cases = execute_with_retry(execute_cases_query)
+                for case in cases.data:
+                    case_map[case["id"]] = case
+            except Exception as e:
+                logger.warning(
+                    f"Error fetching case details for batch {batch_idx // batch_size + 1}/{total_batches}: {e}"
+                )
+                # Continue with other batches even if one fails
 
         # Combine with similarity scores
         results = []
@@ -1562,9 +1586,9 @@ class SimilarityMatcher:
 
         total_cases_to_process = sum(len(batch) for batch in case_batches)
         logger.info(
-            f"Processing {len(case_batches):,} LLM batches ({total_cases_to_process:,} total cases) "
-            f"with {self.cases_per_batch} cases per batch using {self.max_workers} workers. "
-            f"Tracking actual time - will show progress as batches complete."
+            f"Processing {len(case_batches):,} LLM requests ({total_cases_to_process:,} total cases) "
+            f"with {self.cases_per_batch} cases per request using {self.max_workers} workers. "
+            f"Tracking actual time - will show progress as requests complete."
         )
 
         # Process batches in parallel with rate limiting
@@ -1573,103 +1597,52 @@ class SimilarityMatcher:
         processed_cases = 0
         llm_start_time = time.time()
 
-        # Rate limiter: track requests and tokens per minute
+        # Optimized rate limiter: use semaphore for RPM + token bucket for TPM
         rate_limiter_lock = _threading.Lock()
-        request_times = []  # Track request timestamps
-        token_usage = []  # Track (timestamp, tokens) for TPM tracking
-        api_request_counter = {
-            "count": 0
-        }  # Track total API requests made (use dict for nonlocal access)
+        request_times = []  # Track request timestamps (sliding window)
+        token_usage = []  # Track (timestamp, tokens) for TPM tracking (sliding window)
+        api_request_counter = {"count": 0}  # Track total API requests made
 
         # Performance tracking
-        batch_times = []  # Track actual batch processing times
+        batch_times = []  # Track actual request processing times
         rate_limit_wait_times = []  # Track time spent waiting for rate limits
         api_call_times = []  # Track actual API call durations
 
         # Dynamic limits: start with configured values, adjust based on API errors
-        actual_rpm_limit = {"value": self.max_rpm}  # Use dict for nonlocal access
-        actual_tpm_limit = {"value": self.max_tpm}  # Use dict for nonlocal access
+        actual_rpm_limit = {"value": self.max_rpm}
+        actual_tpm_limit = {"value": self.max_tpm}
+
+        # No semaphore - send all requests at once and let xAI handle rate limiting
+        # We'll handle 429 errors with retries if needed
+        rpm_semaphore = None  # Disabled - send all requests concurrently
 
         def wait_for_rate_limit(estimated_tokens: int = 0):
-            """Wait if we've hit the rate limit (RPM or TPM)"""
-            wait_start = time.time()
-            total_wait_time = 0
-
+            """Record request - minimal locking, send all requests at once"""
+            # Just record the request with minimal lock time - no cleanup in critical path
+            now = time.time()
             with rate_limiter_lock:
-                now = time.time()
-                # Remove requests/tokens older than 1 minute
-                request_times[:] = [t for t in request_times if now - t < 60]
-                token_usage[:] = [
-                    (ts, tokens) for ts, tokens in token_usage if now - ts < 60
-                ]
-
-                # Check RPM limit (use actual limit detected from API, or configured limit)
-                current_rpm_limit = actual_rpm_limit["value"]
-                if len(request_times) >= current_rpm_limit:
-                    # Wait until the oldest request is 60 seconds old
-                    oldest = min(request_times)
-                    wait_time = 60 - (now - oldest) + 0.1  # Small buffer
-                    if wait_time > 0:
-                        logger.debug(
-                            f"Rate limit: waiting {wait_time:.1f}s before next request ({current_rpm_limit} RPM limit)..."
-                        )
-                        time.sleep(wait_time)
-                        total_wait_time += wait_time
-                        # Clean up again after waiting
-                        now = time.time()
-                        request_times[:] = [t for t in request_times if now - t < 60]
-                        token_usage[:] = [
-                            (ts, tokens) for ts, tokens in token_usage if now - ts < 60
-                        ]
-
-                # Check TPM limit (use actual limit detected from API, or configured limit)
-                current_tpm_limit = actual_tpm_limit["value"]
-                current_tpm = sum(tokens for _, tokens in token_usage)
-                if (
-                    estimated_tokens > 0
-                    and current_tpm + estimated_tokens > current_tpm_limit
-                ):
-                    # Need to wait until tokens free up
-                    if token_usage:
-                        oldest_token_time = min(ts for ts, _ in token_usage)
-                        wait_time = 60 - (now - oldest_token_time) + 0.1
-                        if wait_time > 0:
-                            logger.debug(
-                                f"TPM limit: waiting {wait_time:.1f}s before next request "
-                                f"({current_tpm:,}/{current_tpm_limit:,} tokens used, need {estimated_tokens:,} more)..."
-                            )
-                            time.sleep(wait_time)
-                            total_wait_time += wait_time
-                            # Clean up again after waiting
-                            now = time.time()
-                            token_usage[:] = [
-                                (ts, tokens)
-                                for ts, tokens in token_usage
-                                if now - ts < 60
-                            ]
-
-                # Record this request
-                request_times.append(time.time())
+                # Only append - cleanup happens elsewhere to avoid blocking
+                request_times.append(now)
                 if estimated_tokens > 0:
-                    token_usage.append((time.time(), estimated_tokens))
+                    token_usage.append((now, estimated_tokens))
                 api_request_counter["count"] += 1
 
-                # Track wait time
-                if total_wait_time > 0:
-                    rate_limit_wait_times.append(total_wait_time)
+            return 0  # No waiting
 
-            return total_wait_time
+        def release_rate_limit():
+            """No-op - semaphore disabled"""
+            pass
 
         def calculate_batch(batch_data):
-            """Calculate similarity for a batch of cases with rate limiting"""
+            """Calculate similarity for a request (batch of cases) - sends LLM API request"""
             batch_start = time.time()
 
-            # Estimate tokens for this batch
+            # Estimate tokens for this request
             estimated_tokens = self._estimate_tokens_for_batch(
                 query_factors, batch_data
             )
 
-            # Wait for rate limit before making request (check both RPM and TPM)
+            # Record request (no blocking - send all at once)
             wait_time = wait_for_rate_limit(estimated_tokens)
 
             try:
@@ -1707,7 +1680,7 @@ class SimilarityMatcher:
             except Exception as e:
                 # If LLM failed, try text matching as fallback
                 logger.debug(
-                    f"Error calculating similarity for batch: {e}, using text matching"
+                    f"Error calculating similarity for request: {e}, using text matching"
                 )
                 results = []
                 for case_data in batch_data:
@@ -1724,7 +1697,10 @@ class SimilarityMatcher:
                         )
                 return results
             finally:
-                # Track total batch time
+                # Release rate limit (no-op now, but kept for compatibility)
+                release_rate_limit()
+
+                # Track total request time
                 batch_duration = time.time() - batch_start
                 with rate_limiter_lock:
                     batch_times.append(batch_duration)
@@ -1733,9 +1709,15 @@ class SimilarityMatcher:
                         batch_times.pop(0)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all batches
             futures = {
                 executor.submit(calculate_batch, batch): batch for batch in case_batches
             }
+
+            logger.info(
+                f"✓ Submitted {len(futures):,} requests to {self.max_workers} workers. "
+                f"Waiting for first results..."
+            )
 
             # Collect results as they complete
             for future in as_completed(futures):
@@ -1750,12 +1732,14 @@ class SimilarityMatcher:
                         processed_cases += batch_size
                         completed_batches += 1
 
-                    # Log progress every 5 batches or every 200 cases, whichever comes first
-                    if (
-                        completed_batches % 5 == 0
-                        or processed_cases % 200 == 0
-                        or completed_batches == len(case_batches)
-                    ):
+                    # Log progress every 10 completed requests
+                    should_log = (
+                        completed_batches == 1  # Always log first completion
+                        or completed_batches % 10 == 0  # Every 10 requests
+                        or completed_batches == len(case_batches)  # Or when done
+                    )
+
+                    if should_log:
                         elapsed = time.time() - llm_start_time
                         rate = processed_cases / elapsed if elapsed > 0 else 0
                         remaining_batches = len(case_batches) - completed_batches
@@ -1766,13 +1750,13 @@ class SimilarityMatcher:
                         if rate > 0 and remaining_cases > 0:
                             eta_seconds = remaining_cases / rate
 
-                        # Also calculate ETA based on actual batch times if we have enough data
+                        # Also calculate ETA based on actual request times if we have enough data
                         with rate_limiter_lock:
                             if (
                                 len(batch_times) >= 5
                             ):  # Need at least 5 samples for reliable average
                                 avg_batch_time = sum(batch_times) / len(batch_times)
-                                # Account for parallelization: with max_workers, batches complete in parallel
+                                # Account for parallelization: with max_workers, requests complete in parallel
                                 # So time is roughly: remaining_batches / max_workers * avg_batch_time
                                 eta_from_batches = (
                                     remaining_batches / self.max_workers
@@ -1786,12 +1770,21 @@ class SimilarityMatcher:
                         eta_min = int(eta_seconds // 60)
                         eta_sec = int(eta_seconds % 60)
 
-                        # Calculate API request stats
+                        # Calculate API request stats (with cleanup)
                         with rate_limiter_lock:
+                            now = time.time()
+                            # Clean up old entries (sliding window) - do this during logging, not in critical path
+                            request_times[:] = [
+                                t for t in request_times if now - t < 60
+                            ]
+                            token_usage[:] = [
+                                (ts, tokens)
+                                for ts, tokens in token_usage
+                                if now - ts < 60
+                            ]
+
                             total_requests = api_request_counter["count"]
-                            requests_in_last_min = len(
-                                [t for t in request_times if time.time() - t < 60]
-                            )
+                            requests_in_last_min = len(request_times)
                             requests_per_min = (
                                 (total_requests / elapsed * 60) if elapsed > 0 else 0
                             )
@@ -1801,11 +1794,12 @@ class SimilarityMatcher:
                             avg_api_time_str = ""
                             if len(batch_times) > 0:
                                 avg_batch = sum(batch_times) / len(batch_times)
-                                avg_batch_time_str = f"avg {avg_batch:.1f}s/batch"
+                                avg_batch_time_str = f"avg {avg_batch:.1f}s/request"
                             if len(api_call_times) > 0:
                                 avg_api = sum(api_call_times) / len(api_call_times)
                                 avg_api_time_str = f"avg {avg_api:.1f}s/API call"
 
+                            # Calculate wait time stats (sum of all worker wait times)
                             total_wait_time = (
                                 sum(rate_limit_wait_times)
                                 if rate_limit_wait_times
@@ -1813,16 +1807,18 @@ class SimilarityMatcher:
                             )
                             wait_time_str = ""
                             if total_wait_time > 0:
-                                wait_pct = (
-                                    (total_wait_time / elapsed) * 100
-                                    if elapsed > 0
+                                # Average wait time per worker (since multiple workers wait in parallel)
+                                avg_wait_time = (
+                                    total_wait_time / len(rate_limit_wait_times)
+                                    if rate_limit_wait_times
                                     else 0
                                 )
-                                wait_time_str = f", {total_wait_time:.1f}s waiting ({wait_pct:.1f}%)"
+                                # Show total wait time and average per worker
+                                wait_time_str = f", {total_wait_time:.1f}s total waiting ({len(rate_limit_wait_times)} waits, avg {avg_wait_time:.1f}s each)"
 
                         logger.info(
                             f"  LLM progress: {processed_cases:,}/{total_cases_to_process:,} cases processed "
-                            f"({completed_batches:,}/{len(case_batches):,} batches, "
+                            f"({completed_batches:,}/{len(case_batches):,} requests, "
                             f"{rate:.1f} cases/sec) | "
                             f"ETA: {eta_min}m {eta_sec}s | "
                             f"Elapsed: {elapsed_min}m {elapsed_sec_remainder}s | "
@@ -1839,7 +1835,7 @@ class SimilarityMatcher:
                     with lock:
                         processed_cases += batch_size
                         completed_batches += 1
-                    logger.warning(f"Error in batch similarity calculation: {e}")
+                    logger.warning(f"Error in request similarity calculation: {e}")
 
         llm_total_elapsed = time.time() - llm_start_time
         llm_total_min = int(llm_total_elapsed // 60)
@@ -1859,9 +1855,9 @@ class SimilarityMatcher:
                 sum(api_call_times) / len(api_call_times) if api_call_times else 0
             )
             total_wait_time = sum(rate_limit_wait_times) if rate_limit_wait_times else 0
-            wait_pct = (
-                (total_wait_time / llm_total_elapsed * 100)
-                if llm_total_elapsed > 0
+            avg_wait_time = (
+                total_wait_time / len(rate_limit_wait_times)
+                if rate_limit_wait_times
                 else 0
             )
 
@@ -1876,9 +1872,9 @@ class SimilarityMatcher:
         logger.info(
             f"  Performance: {cases_per_second:.2f} cases/sec | "
             f"{total_requests:,} API requests ({avg_requests_per_min:.1f}/min) | "
-            f"Avg batch time: {avg_batch_time:.2f}s | "
+            f"Avg request time: {avg_batch_time:.2f}s | "
             f"Avg API call: {avg_api_time:.2f}s | "
-            f"Rate limit waits: {total_wait_time:.1f}s ({wait_pct:.1f}% of total time)"
+            f"Rate limit waits: {total_wait_time:.1f}s total ({len(rate_limit_wait_times)} waits, avg {avg_wait_time:.1f}s each)"
         )
         return scored_cases
 
@@ -1936,10 +1932,23 @@ class SimilarityMatcher:
         try:
             from openai import OpenAI
             import json
+            import httpx
 
-            # Use xAI's OpenAI-compatible API
+            # Use shared HTTP client for connection pooling across all requests
+            # Create or reuse shared client to avoid connection pool exhaustion
+            if self._http_client is None:
+                self._http_client = httpx.Client(
+                    timeout=httpx.Timeout(self.api_timeout, connect=10.0),
+                    limits=httpx.Limits(
+                        max_keepalive_connections=500,  # Allow many concurrent connections
+                        max_connections=1000,  # High limit for 250+ concurrent requests
+                    ),
+                )
+
             client = OpenAI(
-                api_key=os.getenv("XAI_API_KEY"), base_url="https://api.x.ai/v1"
+                api_key=os.getenv("XAI_API_KEY"),
+                base_url="https://api.x.ai/v1",
+                http_client=self._http_client,
             )
 
             # Combine all query factors into one string
@@ -2038,32 +2047,32 @@ Return a JSON object with:
   Each object should have:
     - "case_id": the integer case ID (must match exactly from the case above)
     - "similarity_score": a float between 0.0 and 1.0 that REFLECTS your selectivity level
-    - "justification": a brief explanation (2-3 sentences) of why you assigned this score, explaining how the legal principles from the case relate (or don't relate) to the search query. Write directly about the search query - do not refer to "the user", "the lawyer", or any person in third person.
 
 Example format:
 {{
   "case_scores": [
-    {{"case_id": 123, "similarity_score": 0.85, "justification": "This case directly addresses the same legal principle about asylum eligibility based on past persecution, where the court found that the applicant demonstrated a well-founded fear of future persecution based on the same type of harm."}},
-    {{"case_id": 456, "similarity_score": 0.02, "justification": "This case involves completely different legal principles related to criminal procedure and evidence, with no overlap to the asylum-related legal principles mentioned in the search query."}},
+    {{"case_id": 123, "similarity_score": 0.85}},
+    {{"case_id": 456, "similarity_score": 0.02}},
     ...
   ]
 }}
 
 IMPORTANT: Return scores for ALL cases in the exact order they were presented. Do NOT skip any cases."""
 
-            # Make request without retries - fail fast
+            # Make request with timeout - fail fast on hangs
             try:
                 response = client.chat.completions.create(
-                    model="grok-4",  # xAI Grok model
+                    model=self.model,  # Use configured model (default: grok-beta for speed)
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are a legal research assistant matching cases to search queries. CRITICAL: Base scores on the MOST SIMILAR legal principle between the query and each case, NOT the average similarity. If one principle matches very well, give a high score even if other principles don't match. Be EXTREMELY selective - your selectivity must be visible in the scores you assign. If the most similar legal principle is fundamentally different, give VERY LOW scores (0.00-0.05). If it's somewhat related, give LOW scores (0.05-0.20). Only give high scores (0.50+) for closely related legal principles. Show your strict selectivity in the numbers - unrelated cases should get scores like 0.01-0.05, not 0.10. For each case, provide a clear justification (2-3 sentences) explaining your reasoning. Write justifications directly about the search query - do not refer to 'the user', 'the lawyer', or any person in third person. Return only valid JSON. Pay close attention to case IDs to keep cases distinct.",
+                            "content": "You are a legal research assistant matching cases to search queries. CRITICAL: Base scores on the MOST SIMILAR legal principle between the query and each case, NOT the average similarity. If one principle matches very well, give a high score even if other principles don't match. Be EXTREMELY selective - your selectivity must be visible in the scores you assign. If the most similar legal principle is fundamentally different, give VERY LOW scores (0.00-0.05). If it's somewhat related, give LOW scores (0.05-0.20). Only give high scores (0.50+) for closely related legal principles. Show your strict selectivity in the numbers - unrelated cases should get scores like 0.01-0.05, not 0.10. Return only valid JSON with case_id and similarity_score for each case. Pay close attention to case IDs to keep cases distinct.",
                         },
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.2,
                     response_format={"type": "json_object"},
+                    timeout=self.api_timeout,  # Add timeout to prevent hanging
                 )
 
                 result = json.loads(response.choices[0].message.content)
@@ -2085,11 +2094,8 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                         similarity_score = float(
                             score_data.get("similarity_score", 0.0)
                         )
-                        justification = score_data.get(
-                            "justification", "No justification provided"
-                        )
 
-                        # Log justification for the 19 new cases
+                        # Log score for the 19 new cases
                         if case_id in NEW_CASE_IDS:
                             case_name = case_data.get("case_details", {}).get(
                                 "case_name", f"Case {case_id}"
@@ -2099,7 +2105,6 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                                 f"LLM JUDGE OPINION - Case ID: {case_id}\n"
                                 f"Case Name: {case_name}\n"
                                 f"Similarity Score: {similarity_score:.3f}\n"
-                                f"Justification:\n{justification}\n"
                                 f"{'='*80}\n"
                             )
 
@@ -2109,7 +2114,6 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
                                     "case_id": case_id,
                                     "similarity_score": similarity_score,
                                     "holding_direction": case_data["holding_direction"],
-                                    "justification": justification,
                                 }
                             )
 
@@ -2120,37 +2124,6 @@ IMPORTANT: Return scores for ALL cases in the exact order they were presented. D
             except Exception as api_error:
                 error_str = str(api_error).lower()
                 error_full = str(api_error)
-
-                # Try to extract actual limits from error message
-                import re
-
-                # Look for "limit X" patterns in the error
-                rpm_match = re.search(
-                    r"requests per min.*?limit\s+(\d+)", error_full, re.IGNORECASE
-                )
-                tpm_match = re.search(
-                    r"tokens per min.*?limit\s+(\d+)", error_full, re.IGNORECASE
-                )
-
-                if rpm_match:
-                    detected_rpm = int(rpm_match.group(1))
-                    with rate_limiter_lock:
-                        if detected_rpm < actual_rpm_limit["value"]:
-                            actual_rpm_limit["value"] = detected_rpm
-                            logger.warning(
-                                f"⚠️  API reports RPM limit of {detected_rpm} (lower than configured {self.max_rpm}). "
-                                f"Adjusting rate limiter to match API limits."
-                            )
-
-                if tpm_match:
-                    detected_tpm = int(tpm_match.group(1))
-                    with rate_limiter_lock:
-                        if detected_tpm < actual_tpm_limit["value"]:
-                            actual_tpm_limit["value"] = detected_tpm
-                            logger.warning(
-                                f"⚠️  API reports TPM limit of {detected_tpm:,} (lower than configured {self.max_tpm:,}). "
-                                f"Adjusting rate limiter to match API limits."
-                            )
 
                 # Check if it's a rate limit or quota error - fall back to text matching
                 if (

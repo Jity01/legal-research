@@ -44,8 +44,10 @@ app = Flask(
 
 # Initialize components - configured for xAI (480 RPM, 30k TPM)
 # Uses fts_vector prefiltering to reduce 99k cases → 20k before LLM calls
+# Max workers calculation: 480 RPM with ~120s API calls = ~960 theoretical max concurrent
+# Using 500 for safety margin (allows for rate limit buffer and system overhead)
 similarity_matcher = SimilarityMatcher(
-    max_workers=40,  # xAI: 480 RPM supports 40+ workers
+    max_workers=500,  # xAI: 480 RPM, ~120s API calls = ~960 theoretical max, using 500 for safety
     use_llm=True,
     cases_per_batch=40,  # xAI: 30k TPM supports 40 cases per batch
     db_batch_size=50,
